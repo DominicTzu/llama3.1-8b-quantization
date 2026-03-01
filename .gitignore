@@ -1,0 +1,61 @@
+# --- outputs / artifacts ---
+out/
+**/out/
+data/
+**/data/
+.cache/
+**/.cache/
+
+# --- never commit home / env artifacts ---
+.bashrc
+.profile
+.bash_history
+.ipython/
+**/.ipython/
+.jupyter/
+**/.jupyter/
+.launchpadlib/
+**/.launchpadlib/
+.local/
+**/.local/
+.config/
+**/.config/
+.ssh/
+**/.ssh/
+.conda/
+**/.conda/
+
+# --- model / tensor artifacts ---
+**/*.safetensors
+**/*.bin
+**/*.pt
+**/*.pth
+**/*.ckpt
+**/*.so
+**/*.dylib
+**/*.dll
+
+# --- logs ---
+runs/
+**/runs/
+wandb/
+**/wandb/
+logs/
+**/logs/
+*.log
+
+# --- python ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# --- notebooks ---
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
