@@ -1,6 +1,6 @@
 ## Experiment Goal
 
-Build a reproducible, resume-ready compression pipeline for Qwen3-14B that applies structured pruning → recovery fine-tuning → quantization, while measuring the accuracy/throughput trade-offs. We compare SFT-based recovery (main) vs knowledge distillation recovery (ablation), and report results before and after final W4A16 quantization to quantify quantization sensitivity.
+Build a reproducible, resume-ready compression pipeline for meta-llama/Llama-3.1-8B-Instruct that applies structured pruning → recovery fine-tuning → quantization, while measuring the accuracy/throughput trade-offs. We compare SFT-based recovery (main) vs knowledge distillation recovery (ablation), and report results before and after final W4A16 quantization to quantify quantization sensitivity.
 
 ## Tools
 	•	Hugging Face Transformers: model/tokenizer loading, training loop (Trainer), checkpoint I/O
@@ -10,6 +10,7 @@ Build a reproducible, resume-ready compression pipeline for Qwen3-14B that appli
 	•	Hugging Face Datasets: dataset loading and preprocessing
 	•	PyTorch: training backend
 	•	Matplotlib / Pandas: metrics aggregation and visualization
+    •   GPU: 1 RTX Pro 6000 ada 48G
 
 ## Datasets
 
@@ -71,25 +72,20 @@ We intentionally adopt a relatively aggressive pruning setup (2:4, 50% sparsity)
 	•	Goal: produce a visible recovery curve (pruned → SFT/KD recovery → quantized).
 	•	Not a goal: pushing SOTA accuracy under pruning.
 
-### Why we export back to a dense checkpoint
+### (optional)Why we export back to a dense checkpoint
 
 After pruning, we export the pruned model into a standard “dense” Hugging Face checkpoint (bf16/fp16 weights) before fine-tuning. This avoids tooling incompatibilities (e.g., some training/QLoRA loaders may not support compressed-tensors formats reliably) and makes the recovery stage (SFT/KD) straightforward and reproducible.
+If you export directly as dense model after pruning, this step is not necessary.
 
 ### Key parameter choices (pruning)
-	•	SEED = 0
-Fixes randomness for dataset sampling and improves reproducibility.
-	•	NUM_CALIB_SAMPLES = 512
-Number of calibration examples used for pruning statistics. 512 is a common default in official workflows, balancing representativeness and runtime.
-	•	MAX_SEQ_LEN = 1024
-Maximum sequence length used during pruning calibration. We keep it modest to fit comfortably on a 48GB GPU, and increase to 2048 only if memory allows.
-	•	SPARSITY = 0.5 and MASK_STRUCTURE = "2:4"
-We enforce 2:4 semi-structured pruning, i.e., for every 4 weights, keep 2.
+	•	SEED = 0: Fixes randomness for dataset sampling and improves reproducibility.
+	•	NUM_CALIB_SAMPLES = 512: Number of calibration examples used for pruning statistics. 512 is a common default in official workflows, balancing representativeness and runtime.
+	•	MAX_SEQ_LEN = 1024: Maximum sequence length used during pruning calibration. We keep it modest to fit comfortably on a 48GB GPU, and increase to 2048 only if memory allows.
+	•	SPARSITY = 0.5 and MASK_STRUCTURE = "2:4": We enforce 2:4 semi-structured pruning, i.e., for every 4 weights, keep 2 (which is pretty aggressive to a 8b model).
 	•	This corresponds to 50% sparsity.
 	•	A less aggressive alternative is 3:4 (set MASK_STRUCTURE="3:4" and SPARSITY=0.25).
-	•	DAMPENING_FRAC = 0.001, BLOCK_SIZE = 128
-Stability/performance-related SparseGPT settings. We keep standard conservative values rather than tuning.
-	•	TARGETS = ["Linear"], IGNORE = ["re:.*lm_head"]
-We prune Linear layers (the dominant parameter contributor) and exclude lm_head to reduce the risk of damaging the output projection and destabilizing generation.
+	•	DAMPENING_FRAC = 0.001, BLOCK_SIZE = 128: Stability/performance-related SparseGPT settings. We keep standard conservative values rather than tuning.
+	•	TARGETS = ["Linear"], IGNORE = ["re:.*lm_head"]: We prune Linear layers (the dominant parameter contributor) and exclude lm_head to reduce the risk of damaging the output projection and destabilizing generation.
 
 ## Recovery Fine-tuning (SFT + KD Ablation)
 
@@ -116,23 +112,52 @@ Traditional token-level KD minimizes a KL divergence between teacher and student
 Role in this project: ablation baseline for recovery—helps isolate whether “learning from teacher outputs” changes post-pruning and post-quantization robustness compared to standard SFT supervision.
 
 ### Key training settings
-	•	SEED = 0
-Ensures reproducible sampling, splitting, and training behavior.
-	•	MAX_SEQ_LEN = 1024
-Caps training sequence length for stability and throughput on a 48GB GPU.
-	•	EVAL_RATIO = 0.02
-Holds out 2% of the (10k) training subset for lightweight training-time monitoring.
-	•	USE_QLORA = True
-Uses QLoRA (4-bit base + LoRA adapters) to reduce memory footprint.
-If set to False, we run standard LoRA on bf16 weights.
-	•	LR = 1e-4, MAX_STEPS = 600
-Conservative recovery budget: enough to observe a clear recovery trend without turning this into a large-scale training run.
-	•	BATCH = 1, GRAD_ACCUM = 32
-Effective batch size is achieved via gradient accumulation under GPU memory constraints.
+	•	SEED = 0: Ensures reproducible sampling, splitting, and training behavior.
+	•	MAX_SEQ_LEN = 1024: Caps training sequence length for stability and throughput on a 48GB GPU.
+	•	EVAL_RATIO = 0.02: Holds out 2% of the (10k) training subset for lightweight training-time monitoring.
+	•	USE_QLORA = False: Only uses LoRA to reduce memory footprint.
+	•	LR = 2e-5, MAX_STEPS = 600: Conservative recovery budget: enough to observe a clear recovery trend without turning this into a large-scale training run.
+	•	BATCH = 1, GRAD_ACCUM = 32: Effective batch size is achieved via gradient accumulation under GPU memory constraints.
 	•	LoRA hyperparameters
 	•	LORA_R = 16
 	•	LORA_ALPHA = 32
 	•	LORA_DROPOUT = 0.05
-	•	LORA_TARGET_MODULES = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
-We adapt both attention projections and MLP projections, a common configuration for efficient recovery with low trainable-parameter overhead.
+	•	LORA_TARGET_MODULES = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]: We adapt both attention projections and MLP projections, a common configuration for efficient recovery with low trainable-parameter overhead.
+
+## Pre-quantization evaluation
+We use the above-mentioned evaluation dataset to evaluate base model, sft model as well as kd model. The results show that with 50% sparsity agressive pruning, the base model is severely damaged. It might be better if we only use 25% sparsity. Since this project is set to compare the performance of all three models, the results served this purpose.
+
+## Quantization (AWQ, W4A16)
+
+### What is quantization?
+
+Quantization reduces the numerical precision of model weights (and sometimes activations) to shrink memory footprint and improve inference throughput. In LLM deployment, the most common target is 4-bit weight quantization, because weights dominate memory bandwidth.
+
+In this project we quantize after recovery (SFT/KD) and adapter merge, so the quantized checkpoint represents the final deployable model.
+
+### W4A16 (what it means)
+	•	W4: model weights are stored in 4-bit integers (with per-group scale/zero-point).
+	•	A16: activations remain in 16-bit (fp16/bf16) during inference.
+
+This is a practical deployment trade-off: large memory savings from W4, while keeping activations in higher precision to preserve accuracy and stability.
+
+### Why AWQ?
+
+We use AWQ (Activation-aware Weight Quantization), which chooses quantization scaling based on activation statistics collected from a calibration set. Compared to naive 4-bit rounding, AWQ typically preserves accuracy better under the same bit-width by placing more quantization “resolution” where activations matter most.
+
+Conceptually:
+	1.	Run the model on a small calibration set (no gradients).
+	2.	Collect activation statistics for linear layers.
+	3.	Compute per-group scales (and zero-points for asymmetric schemes).
+	4.	Quantize weights to 4-bit using these learned scales.
+
+### Key settings in our AWQ run
+	•	Scheme: W4A16_ASYM: Asymmetric 4-bit weight quantization with 16-bit activations. “ASYM” means weights use a scale + zero-point (better fit when weight distributions are not centered).
+	•	Group size: 128: We quantize weights in groups of 128 values sharing the same scale/zero-point. Larger groups compress better but can lose accuracy; 128 is a common, well-tested default.
+	•	Targets: Linear (ignore lm_head): We quantize the main compute-heavy Linear layers while leaving lm_head unquantized for stability.
+	•	Calibration: 512 samples, MAX_SEQ_LEN=2048: We use a small calibration subset to estimate activation statistics. No parameter updates are performed.
+
+## Post-quantization evaluation
+same as pre-quant.
+8B model usually needs 50k+ sft data and at least 1000 steps to recover. and 50% sparsity is relatively aggressive. Since we only want to validate the general conclusion, we didn't scale this experiment up (mostly because we are so poor).
 

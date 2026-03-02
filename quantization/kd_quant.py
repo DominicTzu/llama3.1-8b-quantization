@@ -8,7 +8,7 @@ import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from llmcompressor import oneshot
+from llmcompressor.entrypoints.oneshot import oneshot
 from llmcompressor.modifiers.awq import AWQModifier
 
 
@@ -16,13 +16,14 @@ from llmcompressor.modifiers.awq import AWQModifier
 # CONFIG (edit here)
 # =========================
 # Quantize THIS model (merged full model recommended)
-MODEL_DIR = "/root/out/qwen3-14b-pruned-kd-merged-bf16"
+MODEL_DIR = "/root/out/llama-31-8b-pruned-kd-merged-bf16"
+MODEL_BASE="meta-llama/Llama-3.1-8B-Instruct"
 
 # Calibration data (your jsonl, messages format)
 CALIB_JSONL = "/root/data/train_data/calib_1000.jsonl"
 
 # Output
-OUT_DIR = "/root/out/qwen3-14b-pruned-kd-merged-AWQ-W4A16-G128"
+OUT_DIR = "/root/out/llama-31-8b-pruned-kd-merged-AWQ-W4A16-G128"
 
 SEED = 0
 
@@ -64,8 +65,8 @@ def main():
     if not os.path.isfile(CALIB_JSONL):
         raise FileNotFoundError(f"Calibration JSONL not found: {CALIB_JSONL}")
 
-    print(f"[1/6] Loading tokenizer from: {MODEL_DIR}")
-    tok = AutoTokenizer.from_pretrained(MODEL_DIR, use_fast=True, trust_remote_code=True)
+    print(f"[1/6] Loading tokenizer from: {MODEL_BASE}")
+    tok = AutoTokenizer.from_pretrained(MODEL_BASE, use_fast=True, trust_remote_code=True)
 
     print(f"[2/6] Loading calibration set: {CALIB_JSONL}")
     ds = load_dataset("json", data_files=CALIB_JSONL, split="train")
