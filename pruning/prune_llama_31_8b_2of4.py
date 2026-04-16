@@ -1,9 +1,10 @@
 # prune_llama_31_8b_2of4.py
 
+
 import os
 import json
 import random
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import torch
 import torch.nn as nn
@@ -17,19 +18,19 @@ from llmcompressor.modifiers.pruning.sparsegpt import SparseGPTModifier
 # =========================================================
 # CONFIG
 # =========================================================
-MODEL_ID = "meta-llama/Llama-3.1-8B"
+MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
 
-# 这里建议换成你现在新的 calib 文件
-CALIB_JSONL = "/root/data/sft/calib_1000.jsonl"
+# instruct 版 calib 文件
+CALIB_JSONL = "/root/data/instruct_data/calib_1000.jsonl"
 
-OUT_DIR = "/root/out/llama31_8b_base_sparsegpt_2of4_dense"
+OUT_DIR = "/root/out/llama31_8b_instruct_sparsegpt_2of4"
 
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
 
 SEED = 0
 
 # 实际用于剪枝校准的样本数
-NUM_CALIB_SAMPLES = 512
+NUM_CALIB_SAMPLES = 1000
 
 # 校准时截断长度
 MAX_SEQ_LEN = 1024
@@ -51,7 +52,6 @@ TARGETS = [
     "re:.*down_proj$",
 ]
 
-# 不剪 lm_head
 IGNORE = [
     "re:.*lm_head$",
 ]
@@ -79,60 +79,23 @@ def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
 
-def normalize_text(x) -> str:
-    if x is None:
-        return ""
-    return str(x).strip()
-
-
-def build_plain_prompt_from_messages(messages: List[Dict]) -> str:
+def messages_to_text(tok: AutoTokenizer, messages: List[Dict]) -> str:
     """
-    回退用：如果 calib 样本没有 prompt_text，就从 messages 构造一个 plain prompt。
-    不用 chat template。
+    instruct 版：直接走 chat template
     """
-    if not isinstance(messages, list):
+    if not isinstance(messages, list) or len(messages) == 0:
         return ""
 
-    user_text = ""
-    for m in messages:
-        if (
-            isinstance(m, dict)
-            and m.get("role") == "user"
-            and isinstance(m.get("content"), str)
-            and m["content"].strip()
-        ):
-            user_text = m["content"].strip()
-            break
-
-    if not user_text:
-        return ""
-
-    return (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        f"### Instruction:\n{user_text}\n\n"
-        "### Response:\n"
+    return tok.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
     )
-
-
-def record_to_text(ex: Dict) -> Dict:
-    """
-    优先使用 prompt_text。
-    这是你当前 base + alpaca 风格数据最应该走的分布。
-    """
-    prompt_text = ex.get("prompt_text", None)
-    if isinstance(prompt_text, str) and prompt_text.strip():
-        text = prompt_text.strip()
-    else:
-        text = build_plain_prompt_from_messages(ex.get("messages", []))
-
-    return {"text": text}
 
 
 def verify_nm_sparsity_2of4(weight: torch.Tensor) -> float:
     """
     返回满足“每4个元素中恰有2个非零”的 group 比例。
-    假设 weight 是二维矩阵，且最后一维可按4分组。
     """
     if weight.ndim != 2:
         return 0.0
@@ -209,14 +172,16 @@ def main():
     ds = load_dataset("json", data_files=CALIB_JSONL, split="train")
     ds = ds.shuffle(seed=SEED)
 
-    print("[3/7] Converting calibration records to plain prompt text")
+    print("[3/7] Converting messages to chat-template text")
+    def _to_text(ex):
+        return {"text": messages_to_text(tok, ex.get("messages", []))}
+
     ds = ds.map(
-        record_to_text,
+        _to_text,
         remove_columns=ds.column_names,
-        desc="record_to_text",
+        desc="messages_to_text",
     )
 
-    # 去掉空样本
     ds = ds.filter(lambda ex: isinstance(ex["text"], str) and len(ex["text"].strip()) > 0)
 
     def _tokenize(ex):
@@ -339,7 +304,7 @@ def main():
         dense_dir = os.path.join(OUT_DIR, "dense")
         ensure_dir(dense_dir)
 
-        # 普通 dense 格式保存：张量里包含很多 0，但文件格式仍是普通 HF checkpoint
+        # 普通 dense 格式保存：张量里很多 0，但文件格式仍是普通 HF checkpoint
         model.save_pretrained(dense_dir, safe_serialization=True)
         tok.save_pretrained(dense_dir)
         tok.save_pretrained(OUT_DIR)

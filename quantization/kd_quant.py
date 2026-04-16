@@ -1,4 +1,4 @@
-# quantize_w4a16_awq.py
+# kd_quant.py
 
 import os
 import json
@@ -17,17 +17,17 @@ from llmcompressor.modifiers.awq.mappings import AWQMapping
 # =========================================================
 # CONFIG
 # =========================================================
-# Quantize THIS merged dense model
-MODEL_DIR = "/root/out/llama-31-8b-pruned-kd-merged-bf16"
+# Quantize THIS merged dense KD model
+MODEL_DIR = "/root/out/llama-31-8b-instruct-pruned-kd-merged-bf16"
 
-# Use base tokenizer to stay aligned with your current pipeline
-MODEL_BASE = "meta-llama/Llama-3.1-8B"
+# Instruct tokenizer
+MODEL_BASE = "meta-llama/Llama-3.1-8B-Instruct"
 
-# Calibration data
-CALIB_JSONL = "/root/data/kd_data/calib_1000.jsonl"
+# Calibration data: 仍然用统一的 instruct calib
+CALIB_JSONL = "/root/data/instruct_data/calib_1000.jsonl"
 
 # Output
-OUT_DIR = "/root/out/llama-31-8b-pruned-kd-merged-awq-w4a16-asym"
+OUT_DIR = "/root/out/llama-31-8b-instruct-pruned-kd-merged-awq-w4a16-asym"
 
 SEED = 0
 
@@ -40,7 +40,9 @@ SCHEME = "W4A16_ASYM"
 IGNORE = ["lm_head"]
 TARGETS = ["Linear"]
 
-# Llama family AWQ mappings from docs
+TORCH_DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+# Llama family AWQ mappings
 LLAMA_AWQ_MAPPINGS = [
     AWQMapping(
         "re:.*input_layernorm",
@@ -70,47 +72,24 @@ def set_seed(seed: int):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def normalize_text(x) -> str:
-    if x is None:
-        return ""
-    return str(x).strip()
 
-def build_plain_prompt_from_messages(messages: List[Dict]) -> str:
+def messages_to_text(tok: AutoTokenizer, messages: List[Dict]) -> str:
     """
-    Fallback only: if prompt_text does not exist, rebuild a plain prompt.
-    No chat template.
+    Instruct version: use chat template directly.
     """
-    if not isinstance(messages, list):
+    if not isinstance(messages, list) or len(messages) == 0:
         return ""
-
-    user_text = ""
-    for m in messages:
-        if (
-            isinstance(m, dict)
-            and m.get("role") == "user"
-            and isinstance(m.get("content"), str)
-            and m["content"].strip()
-        ):
-            user_text = m["content"].strip()
-            break
-
-    if not user_text:
-        return ""
-
-    return (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        f"### Instruction:\n{user_text}\n\n"
-        "### Response:\n"
+    return tok.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=False,
     )
 
-def record_to_text(ex: Dict) -> Dict:
-    prompt_text = ex.get("prompt_text", None)
-    if isinstance(prompt_text, str) and prompt_text.strip():
-        text = prompt_text.strip()
-    else:
-        text = build_plain_prompt_from_messages(ex.get("messages", []))
+
+def record_to_text(ex: Dict, tok: AutoTokenizer) -> Dict:
+    text = messages_to_text(tok, ex.get("messages", []))
     return {"text": text}
+
 
 def summarize_token_lengths(ds, key: str = "input_ids"):
     lengths = [len(x[key]) for x in ds if key in x]
@@ -159,9 +138,10 @@ def main():
     ds = load_dataset("json", data_files=CALIB_JSONL, split="train")
     ds = ds.shuffle(seed=SEED)
 
-    print("[3/6] Converting records to plain prompt text")
+    print("[3/6] Converting records to chat-template text")
     ds = ds.map(
         record_to_text,
+        fn_kwargs={"tok": tok},
         remove_columns=ds.column_names,
         desc="record_to_text",
     )
@@ -191,7 +171,7 @@ def main():
     print(f"[4/6] Loading model from: {MODEL_DIR}")
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_DIR,
-        dtype="auto",
+        torch_dtype=TORCH_DTYPE,
         device_map="auto",
         trust_remote_code=True,
     )

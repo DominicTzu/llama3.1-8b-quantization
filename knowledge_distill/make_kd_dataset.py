@@ -1,4 +1,5 @@
 # make_kd_dataset.py
+
 import os
 import json
 import random
@@ -8,124 +9,44 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
+
+# =========================================================
+# CONFIG
+# =========================================================
 TEACHER_MODEL = "meta-llama/Llama-3.1-8B-Instruct"
 
-# 这里直接基于你之前造好的 SFT 抽
-IN_SFT_JSONL = "/root/data/alpaca_30k_sft_data"
-
-OUT_DIR = "/root/data/kd_data"
-OUT_JSONL = "/root/data/kd_data/kd_15000.jsonl"
+IN_SFT_JSONL = "/root/data/instruct_data/sft_30000.jsonl"
+OUT_DIR = "/root/data/instruct_data"
+OUT_JSONL = "/root/data/instruct_data/kd_15000.jsonl"
 
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
 
 SEED = 0
 N_KD = 15_000
 
-MAX_NEW_TOKENS = 512
+MAX_PROMPT_TOKENS = 1024
+MAX_NEW_TOKENS = 192
+
 TEMPERATURE = 0.0
 TOP_P = 1.0
-
-MAX_PROMPT_TOKENS = 1024
 
 DTYPE = "bfloat16"
 GPU_MEMORY_UTIL = 0.90
 MAX_MODEL_LEN = 2048
 
+# 过滤阈值
+MIN_TEACHER_TOKENS = 8
+MAX_TEACHER_TOKENS = 256
 
+# debug
+DEBUG_N = None   # 比如 100
+
+
+# =========================================================
+# Utils
+# =========================================================
 def set_seed(seed: int):
     random.seed(seed)
-
-
-def normalize_text(x) -> str:
-    if x is None:
-        return ""
-    return str(x).strip()
-
-
-def build_plain_prompt_from_messages(messages: List[Dict]) -> Optional[str]:
-    """
-    不用 chat template。
-    如果旧 SFT 只有 messages，没有 prompt_text，就回退到这里重建 prompt。
-    默认按单轮 user->assistant 的 Alpaca 风格 prompt 构造。
-    """
-    if not isinstance(messages, list) or len(messages) == 0:
-        return None
-
-    user_text = None
-    for m in messages:
-        if (
-            isinstance(m, dict)
-            and m.get("role") == "user"
-            and isinstance(m.get("content"), str)
-            and m["content"].strip()
-        ):
-            user_text = m["content"].strip()
-            break
-
-    if not user_text:
-        return None
-
-    prompt = (
-        "Below is an instruction that describes a task. "
-        "Write a response that appropriately completes the request.\n\n"
-        f"### Instruction:\n{user_text}\n\n"
-        "### Response:\n"
-    )
-    return prompt
-
-
-def get_prompt_text_from_record(rec: Dict) -> Optional[str]:
-    """
-    优先用已有的 prompt_text；
-    没有的话再从 messages 回退重建。
-    """
-    prompt_text = rec.get("prompt_text", None)
-    if isinstance(prompt_text, str) and prompt_text.strip():
-        return prompt_text.strip()
-
-    messages = rec.get("messages", None)
-    return build_plain_prompt_from_messages(messages)
-
-
-def get_gold_target_from_record(rec: Dict) -> str:
-    """
-    尽量把原始 gold target 也保留下来，后面做对比方便。
-    """
-    target_text = rec.get("target_text", None)
-    if isinstance(target_text, str) and target_text.strip():
-        return target_text.strip()
-
-    messages = rec.get("messages", None)
-    if isinstance(messages, list):
-        for m in messages:
-            if (
-                isinstance(m, dict)
-                and m.get("role") == "assistant"
-                and isinstance(m.get("content"), str)
-                and m["content"].strip()
-            ):
-                return m["content"].strip()
-    return ""
-
-
-def get_user_content_from_record(rec: Dict) -> str:
-    """
-    用于兼容你后面如果还想保留 messages 字段。
-    """
-    messages = rec.get("messages", None)
-    if isinstance(messages, list):
-        for m in messages:
-            if (
-                isinstance(m, dict)
-                and m.get("role") == "user"
-                and isinstance(m.get("content"), str)
-                and m["content"].strip()
-            ):
-                return m["content"].strip()
-
-    prompt_text = rec.get("prompt_text", "")
-    return prompt_text.strip()
-
 
 def write_jsonl(path: str, records: List[Dict]):
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -133,7 +54,81 @@ def write_jsonl(path: str, records: List[Dict]):
         for r in records:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
 
+def normalize_text(x) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
 
+def get_prompt_messages_from_record(rec: Dict) -> Optional[List[Dict]]:
+    pm = rec.get("prompt_messages", None)
+    if isinstance(pm, list) and len(pm) > 0:
+        return pm
+    return None
+
+def get_gold_target_from_record(rec: Dict) -> str:
+    t = rec.get("target_text", None)
+    if isinstance(t, str) and t.strip():
+        return t.strip()
+    return ""
+
+def apply_prompt_template(tok: AutoTokenizer, prompt_messages: List[Dict]) -> str:
+    return tok.apply_chat_template(
+        prompt_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+def clean_teacher_text(text: str) -> str:
+    text = text.strip()
+
+    # 截掉模板回卷
+    bad_markers = [
+        "<|start_header_id|>",
+        "<|eot_id|>",
+        "assistant\n",
+        "user\n",
+        "system\n",
+        "### Instruction:",
+        "### Response:",
+    ]
+    for pat in bad_markers:
+        if pat in text:
+            text = text.split(pat)[0].strip()
+
+    # 去掉明显多余空行
+    lines = [x.strip() for x in text.splitlines()]
+    lines = [x for x in lines if x]
+    text = "\n".join(lines).strip()
+
+    return text
+
+def is_repetitive(text: str) -> bool:
+    words = text.split()
+    if len(words) < 8:
+        return False
+    uniq_ratio = len(set(words)) / max(len(words), 1)
+    return uniq_ratio < 0.35
+
+def is_bad_teacher_text(text: str, tok) -> bool:
+    if not text:
+        return True
+    if "###" in text:
+        return True
+    if is_repetitive(text):
+        return True
+
+    toks = tok.encode(text, add_special_tokens=False)
+    if len(toks) < MIN_TEACHER_TOKENS:
+        return True
+    if len(toks) > MAX_TEACHER_TOKENS:
+        return True
+
+    return False
+
+
+# =========================================================
+# Main
+# =========================================================
 def main():
     set_seed(SEED)
     os.makedirs(OUT_DIR, exist_ok=True)
@@ -149,32 +144,41 @@ def main():
 
     print(f"[2/4] Loading source SFT JSONL: {IN_SFT_JSONL}")
     ds = load_dataset("json", data_files=IN_SFT_JSONL, split="train")
+
+    if DEBUG_N is not None:
+        ds = ds.select(range(min(DEBUG_N, len(ds))))
+
     idxs = list(range(len(ds)))
     random.shuffle(idxs)
 
     prompts_text: List[str] = []
     source_rows: List[Dict] = []
-
     seen = set()
 
     for i in idxs:
         rec = ds[i]
 
-        prompt_text = get_prompt_text_from_record(rec)
-        if not prompt_text:
+        prompt_messages = get_prompt_messages_from_record(rec)
+        if prompt_messages is None:
             continue
 
-        if not prompt_text.endswith((" ", "\n")):
-            prompt_text += " "
-
+        prompt_text = apply_prompt_template(tok, prompt_messages)
         prompt_tok_len = len(tok.encode(prompt_text, add_special_tokens=False))
         if prompt_tok_len > MAX_PROMPT_TOKENS:
             continue
 
         gold_target = get_gold_target_from_record(rec)
-        user_content = get_user_content_from_record(rec)
+        if not gold_target:
+            continue
 
-        dup_key = (prompt_text[:500] + "|||" + gold_target[:300]).strip()
+        # 去重：最后一个 user + gold_target
+        last_user = ""
+        for m in reversed(prompt_messages):
+            if m.get("role") == "user":
+                last_user = normalize_text(m.get("content"))
+                break
+
+        dup_key = (last_user[:500] + "|||" + gold_target[:300]).strip()
         if dup_key in seen:
             continue
         seen.add(dup_key)
@@ -183,10 +187,9 @@ def main():
         source_rows.append(
             {
                 "id": rec.get("id", f"row_{i}"),
-                "prompt_text": prompt_text,
-                "gold_target": gold_target,
-                "user_content": user_content,
                 "messages": rec.get("messages", []),
+                "prompt_messages": prompt_messages,
+                "gold_target": gold_target,
                 "meta": {
                     "source_index": i,
                     "prompt_tokens": prompt_tok_len,
@@ -214,6 +217,12 @@ def main():
         temperature=TEMPERATURE,
         top_p=TOP_P,
         max_tokens=MAX_NEW_TOKENS,
+        stop=[
+            "<|eot_id|>",
+            "<|start_header_id|>",
+            "### Instruction:",
+            "### Response:",
+        ],
         stop_token_ids=[tok.eos_token_id] if tok.eos_token_id is not None else None,
     )
 
@@ -221,32 +230,30 @@ def main():
     outputs = llm.generate(prompts_text, sp)
 
     kd_records: List[Dict] = []
-    empty_cnt = 0
+    bad_cnt = 0
 
     for src, out in zip(source_rows, outputs):
         if not out.outputs:
-            empty_cnt += 1
+            bad_cnt += 1
             continue
 
-        teacher_target = out.outputs[0].text.strip()
-        if not teacher_target:
-            empty_cnt += 1
+        teacher_target = clean_teacher_text(out.outputs[0].text)
+
+        if is_bad_teacher_text(teacher_target, tok):
+            bad_cnt += 1
             continue
 
-        teacher_target_tokens = len(
-            tok.encode(teacher_target, add_special_tokens=False)
-        )
+        teacher_target_tokens = len(tok.encode(teacher_target, add_special_tokens=False))
 
         kd_records.append(
             {
                 "id": src["id"],
-                "prompt_text": src["prompt_text"],
+                "prompt_messages": src["prompt_messages"],
+                "messages": src["prompt_messages"] + [
+                    {"role": "assistant", "content": teacher_target}
+                ],
                 "gold_target": src["gold_target"],
                 "teacher_target": teacher_target,
-                "messages": [
-                    {"role": "user", "content": src["user_content"]},
-                    {"role": "assistant", "content": teacher_target},
-                ],
                 "meta": {
                     "teacher_model": TEACHER_MODEL,
                     "prompt_tokens": src["meta"]["prompt_tokens"],
@@ -258,7 +265,7 @@ def main():
     write_jsonl(OUT_JSONL, kd_records)
     print(f"Done. Wrote KD dataset: {OUT_JSONL}")
     print(f"KD rows: {len(kd_records)}")
-    print(f"Empty / skipped generations: {empty_cnt}")
+    print(f"Bad / filtered generations: {bad_cnt}")
 
 
 if __name__ == "__main__":
