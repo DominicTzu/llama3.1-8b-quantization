@@ -1,22 +1,27 @@
 # sft_finetune.py
-import os, random
+
+import os
+import random
 from dataclasses import dataclass
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 import torch
 from datasets import load_dataset
 from transformers import (
-    AutoTokenizer, AutoModelForCausalLM,
-    TrainingArguments, Trainer
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    TrainingArguments,
+    Trainer,
 )
 from peft import LoraConfig, get_peft_model
 
-# ------------------
+
+# =========================================================
 # CONFIG
-# ------------------
-BASE_MODEL = "/root/out/llama-31-8b-dense2of4/dense"
-SFT_JSONL  = "/root/data/train_data/sft_10000.jsonl"
-OUT_DIR    = "/root/out/pruned-llama31-8b-sft-lora"
+# =========================================================
+BASE_MODEL = "/root/out/llama31_8b_base_sparsegpt_2of4_dense/dense"
+SFT_JSONL = "/root/data/alpaca_base_data/sft_30000.jsonl"
+OUT_DIR = "/root/out/pruned-llama31-8b-sft-lora"
 
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
 
@@ -28,41 +33,124 @@ USE_QLORA = False
 print(f"qlora: {USE_QLORA}")
 
 LR = 2e-5
-MAX_STEPS = 500
+MAX_STEPS = 1000
 BATCH = 1
 GRAD_ACCUM = 32
 
-LORA_R = 16
+LORA_R = 8
 LORA_ALPHA = 32
 LORA_DROPOUT = 0.05
-LORA_TARGET_MODULES = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
+LORA_TARGET_MODULES = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "gate_proj", "up_proj", "down_proj"
+]
 
-# 防止“全 -100”导致 loss 无 grad
-MIN_SUP_TOKENS = 32  # 每条样本至少留 32 个 assistant token 参与监督
+MIN_SUP_TOKENS = 32
 
-# ------------------
+
+# =========================================================
 # Utilities
-# ------------------
+# =========================================================
 def set_seed(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-def build_prompt_and_full(tok, messages: List[Dict]) -> Dict[str, str]:
-    # 只使用第一轮 user/assistant（你的 sft jsonl 就是这样）
-    user = messages[0]["content"]
-    assistant = messages[1]["content"]
 
-    prompt_msgs = [{"role": "user", "content": user}]
-    if hasattr(tok, "apply_chat_template"):
-        prompt_text = tok.apply_chat_template(prompt_msgs, tokenize=False, add_generation_prompt=True)
+def normalize_text(x) -> str:
+    if x is None:
+        return ""
+    return str(x).strip()
+
+
+def build_plain_prompt_from_messages(messages: List[Dict]) -> str:
+    """
+    回退逻辑：如果数据里没有 prompt_text / target_text，就从 messages 构造。
+    不用 chat template。
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return ""
+
+    user = ""
+    for m in messages:
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "user"
+            and isinstance(m.get("content"), str)
+            and m["content"].strip()
+        ):
+            user = m["content"].strip()
+            break
+
+    if not user:
+        return ""
+
+    return (
+        "Below is an instruction that describes a task. "
+        "Write a response that appropriately completes the request.\n\n"
+        f"### Instruction:\n{user}\n\n"
+        "### Response:\n"
+    )
+
+
+def get_target_from_messages(messages: List[Dict]) -> str:
+    if not isinstance(messages, list):
+        return ""
+    for m in messages:
+        if (
+            isinstance(m, dict)
+            and m.get("role") == "assistant"
+            and isinstance(m.get("content"), str)
+            and m["content"].strip()
+        ):
+            return m["content"].strip()
+    return ""
+
+
+def build_example(tok, ex: Dict) -> Dict[str, Any]:
+    """
+    统一生成：
+    - prompt_text
+    - target_text
+    - full_text
+    - prompt_len_raw
+    - full_len_raw
+    - target_len_raw
+    """
+    prompt_text = normalize_text(ex.get("prompt_text"))
+    target_text = normalize_text(ex.get("target_text"))
+
+    if not prompt_text:
+        prompt_text = build_plain_prompt_from_messages(ex.get("messages", []))
+    if not target_text:
+        target_text = get_target_from_messages(ex.get("messages", []))
+
+    if tok.eos_token:
+        full_text = prompt_text + target_text + tok.eos_token
     else:
-        prompt_text = f"USER: {user}\nASSISTANT: "
+        full_text = prompt_text + target_text
 
-    full_text = prompt_text + assistant
-    if tok.eos_token and not full_text.endswith(tok.eos_token):
-        full_text = full_text + tok.eos_token
-    return {"prompt_text": prompt_text, "full_text": full_text}
+    prompt_ids = tok(prompt_text, add_special_tokens=False)["input_ids"]
+    full_ids = tok(full_text, add_special_tokens=False)["input_ids"]
+
+    prompt_len_raw = len(prompt_ids)
+    full_len_raw = len(full_ids)
+    target_len_raw = max(full_len_raw - prompt_len_raw, 0)
+
+    # 左截断下，优先砍 prompt，所以截断后大致还能保留：
+    sup_after_trunc = min(target_len_raw, MAX_SEQ_LEN)
+
+    return {
+        "prompt_text": prompt_text,
+        "target_text": target_text,
+        "full_text": full_text,
+        "prompt_len_raw": prompt_len_raw,
+        "full_len_raw": full_len_raw,
+        "target_len_raw": target_len_raw,
+        "sup_after_trunc": sup_after_trunc,
+    }
+
 
 @dataclass
 class DataCollatorAssistantOnly:
@@ -71,9 +159,7 @@ class DataCollatorAssistantOnly:
 
     def __call__(self, features: List[Dict]) -> Dict[str, torch.Tensor]:
         full_texts = [f["full_text"] for f in features]
-        prompt_texts = [f["prompt_text"] for f in features]
 
-        # IMPORTANT: keep rules consistent (special tokens) + truncation_side already set on tokenizer
         enc_full = self.tokenizer(
             full_texts,
             padding=True,
@@ -82,29 +168,32 @@ class DataCollatorAssistantOnly:
             add_special_tokens=False,
             return_tensors="pt",
         )
-        enc_prompt = self.tokenizer(
-            prompt_texts,
-            padding=False,
-            truncation=True,
-            max_length=self.max_length,
-            add_special_tokens=False,
-        )
 
         labels = enc_full["input_ids"].clone()
         labels[enc_full["attention_mask"] == 0] = -100
 
-        # mask prompt part
-        for i in range(len(features)):
-            p_len = len(enc_prompt["input_ids"][i])
-            p_len = min(p_len, labels.size(1))
-            labels[i, :p_len] = -100
+        for i, f in enumerate(features):
+            full_len_raw = int(f["full_len_raw"])
+            prompt_len_raw = int(f["prompt_len_raw"])
+
+            # 左截断会从序列最左边砍 overflow 个 token
+            overflow = max(full_len_raw - self.max_length, 0)
+
+            # 截断后 full 中实际保留的 prompt token 数
+            prompt_len_kept = max(prompt_len_raw - overflow, 0)
+
+            seq_len_now = int(enc_full["attention_mask"][i].sum().item())
+            prompt_len_kept = min(prompt_len_kept, seq_len_now)
+
+            labels[i, :prompt_len_kept] = -100
 
         enc_full["labels"] = labels
         return enc_full
 
-# ------------------
+
+# =========================================================
 # Main
-# ------------------
+# =========================================================
 set_seed(SEED)
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -119,23 +208,20 @@ tok = AutoTokenizer.from_pretrained(
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
 
-# CRITICAL: preserve tail tokens (assistant) when truncating
+# 左截断：优先保留 assistant 尾部
 tok.truncation_side = "left"
 
 print(f"Loading SFT JSONL: {SFT_JSONL}")
 ds = load_dataset("json", data_files=SFT_JSONL, split="train")
 
-def _map(ex):
-    return build_prompt_and_full(tok, ex["messages"])
+print("Mapping dataset to prompt/target/full...")
+ds = ds.map(build_example, fn_kwargs={"tok": tok}, remove_columns=ds.column_names)
 
-ds = ds.map(_map, remove_columns=ds.column_names)
-
-# Filter out examples with too few supervised assistant tokens after truncation considerations
+print("Filtering invalid / too-short supervised examples...")
 def _keep(ex):
-    p = tok(ex["prompt_text"], add_special_tokens=False)["input_ids"]
-    f = tok(ex["full_text"], add_special_tokens=False)["input_ids"]
-    sup = max(len(f) - len(p), 0)
-    return sup >= MIN_SUP_TOKENS
+    if not ex["prompt_text"] or not ex["target_text"]:
+        return False
+    return int(ex["sup_after_trunc"]) >= MIN_SUP_TOKENS
 
 ds = ds.filter(_keep)
 
@@ -150,11 +236,14 @@ print(f"train rows: {len(train_ds)} | eval rows: {len(eval_ds) if eval_ds is not
 print(f"Loading pruned model (bf16) from: {BASE_MODEL}")
 model = AutoModelForCausalLM.from_pretrained(
     BASE_MODEL,
-    device_map="auto",
     trust_remote_code=True,
-    torch_dtype=torch.bfloat16,
+    torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
     token=HF_TOKEN,
 )
+
+if torch.cuda.is_available():
+    model = model.cuda()
+
 model.config.use_cache = False
 model.train()
 model.enable_input_require_grads()
@@ -167,10 +256,10 @@ lora_cfg = LoraConfig(
     task_type="CAUSAL_LM",
     target_modules=LORA_TARGET_MODULES,
 )
+
 model = get_peft_model(model, lora_cfg)
 model.print_trainable_parameters()
 
-# hard check: avoid "loss has no grad_fn"
 trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 if trainable == 0:
     raise RuntimeError("No trainable parameters found. LoRA target_modules mismatch model module names.")
@@ -187,16 +276,19 @@ args = TrainingArguments(
     lr_scheduler_type="cosine",
     logging_steps=10,
     save_steps=100,
-    eval_strategy="steps" if eval_ds is not None else "no",
+    evaluation_strategy="steps" if eval_ds is not None else "no",
     eval_steps=100 if eval_ds is not None else None,
-    bf16=True,
+    bf16=torch.cuda.is_available(),
     fp16=False,
     gradient_checkpointing=True,
     report_to=[],
     save_total_limit=3,
 )
 
-collator = DataCollatorAssistantOnly(tokenizer=tok, max_length=MAX_SEQ_LEN)
+collator = DataCollatorAssistantOnly(
+    tokenizer=tok,
+    max_length=MAX_SEQ_LEN,
+)
 
 trainer = Trainer(
     model=model,
@@ -208,7 +300,6 @@ trainer = Trainer(
 
 trainer.train()
 
-# Save adapter + tokenizer
 trainer.model.save_pretrained(OUT_DIR)
 tok.save_pretrained(OUT_DIR)
 

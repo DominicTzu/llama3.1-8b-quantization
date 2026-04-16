@@ -11,7 +11,7 @@ from peft import PeftModel
 # CONFIG 
 # =========================
 # Base model should be PRUNED model directory (preferred)
-BASE_MODEL_DIR = "/root/out/llama-31-8b-dense2of4/dense"
+BASE_MODEL_DIR = "/root/out/llama31_8b_base_sparsegpt_2of4_dense/dense"
 
 # Adapter dir produced by finetune script (contains adapter_model.safetensors + adapter_config.json)
 ADAPTER_DIR = "/root/out/pruned-llama31-8b-sft-lora"
